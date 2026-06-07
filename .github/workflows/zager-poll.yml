@@ -1,0 +1,41 @@
+name: Zager stock poll
+
+on:
+  schedule:
+    # Top of every hour, UTC. GitHub may delay runs under load — fine for stock checks.
+    - cron: "0 * * * *"
+  workflow_dispatch: {}   # gives you a "Run workflow" button for manual checks
+
+# Avoid overlapping runs if one is slow
+concurrency:
+  group: zager-poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        working-directory: scripts
+        run: npm install --no-audit --no-fund
+
+      - name: Run poller
+        working-directory: scripts
+        run: node poll-zager.mjs
+        env:
+          ZAGER_FEED_URL: ${{ secrets.ZAGER_FEED_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DEFAULT_THRESHOLD: "3"
+          # Email alerts (optional — leave unset to disable)
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          # Optional: only alert on new items for these brands, e.g. "Invicta,TechnoMarine".
+          # Leave empty for all brands.
+          ARRIVAL_BRANDS: ""
