@@ -1,0 +1,10 @@
+{
+  "name": "zager-monitor",
+  "private": true,
+  "type": "module",
+  "description": "Hourly Zager stock poller for Bubba's Collective",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "papaparse": "^5.4.1"
+  }
+}
