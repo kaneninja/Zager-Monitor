@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bubba's Collective — Command Page</title>
+<style>
+  html, body { margin: 0; background: #eaf0f7; }
+  body { padding: 18px 12px 40px; font-family: 'Manrope', system-ui, sans-serif; }
+  #root { }
+</style>
+<!-- React + Babel from CDN: no build step needed -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script>
+  // On Claude this was window.storage; in a normal browser we use localStorage.
+  if (!window.storage) {
+    window.storage = {
+      get: async (k) => { try { const v = localStorage.getItem(k); return v == null ? null : { key: k, value: v }; } catch { return null; } },
+      set: async (k, v) => { localStorage.setItem(k, v); return { key: k, value: v }; },
+      delete: async (k) => { localStorage.removeItem(k); return { key: k, deleted: true }; },
+    };
+  }
+</script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+// ─────────────────────────────────────────────────────────────
+// Bubba's Collective — Command Page
+// One page, two jobs:
+//   1) Stock watch — add the SKUs you've listed. They save to your
+//      Supabase, the hourly robot reads them and emails you on OUT.
+//      Current status shows here too.
+//   2) Profit — paste a settlement + your cost & shipping; it tallies
+//      profit by day / week / month. Stored in Supabase as well.
+//
+// Connection (URL + publishable key) is entered in the page and saved
+// on THIS device only — never in code or chat. Publishable keys are the
+// browser-safe kind; with the read/write policies you ran once, this
+// page can manage your watchlist and sales.
+// ─────────────────────────────────────────────────────────────
+
+const NAVY = "#042C53", PRIMARY = "#378ADD", DARKBLUE = "#0C447C", BORDER = "#185FA5";
+const GREEN = "#30A46C", RED = "#E5484D", AMBER = "#F5A623", PURPLE = "#8E2D8E", GREY = "#8B98A9";
+const CONN_KEY = "cmd:conn";
+
+const money = (n) => `$${(Number(n) || 0).toFixed(2)}`;
+const norm = (s) => String(s ?? "").trim().toUpperCase();
+const toYMD = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const relTime = (ts) => {
+  if (!ts) return "";
+  const days = Math.floor((Date.now() - new Date(ts).getTime()) / 86400000);
+  if (days <= 0) return "today";
+  if (days === 1) return "1d ago";
+  if (days < 7) return `${days}d ago`;
+  if (days < 30) return `${Math.floor(days / 7)}w ago`;
+  return new Date(ts).toLocaleDateString();
+};
+
+const STATUS = {
+  gone: { c: PURPLE, t: "GONE" }, out: { c: RED, t: "OUT" }, low: { c: AMBER, t: "LOW" },
+  ok: { c: GREEN, t: "OK" }, pending: { c: GREY, t: "PENDING" },
+};
+function parsePayout(text) {
+  const m = text.match(/total settlement amount[\s\S]{0,60}?\$?\s*(-?[\d,]+(?:\.\d+)?)/i);
+  return m ? parseFloat(m[1].replace(/,/g, "")) : null;
+}
+const PERIODS = [{ id: "today", label: "Today" }, { id: "week", label: "Week" }, { id: "month", label: "Month" }, { id: "all", label: "All" }];
+
+function CommandPage() {
+  const [conn, setConn] = useState(null);           // {url, key}
+  const [connForm, setConnForm] = useState({ url: "", key: "" });
+  const [booted, setBooted] = useState(false);
+  const [err, setErr] = useState("");
+
+  const [watch, setWatch] = useState([]);            // watch_models rows
+  const [status, setStatus] = useState({});          // model -> watch_status
+  const [sales, setSales] = useState([]);
+  const [arrivals, setArrivals] = useState([]);
+  const [arrErr, setArrErr] = useState(false);
+  const [newSku, setNewSku] = useState("");
+  const [period, setPeriod] = useState("month");
+  const [paste, setPaste] = useState("");
+  const [sale, setSale] = useState({ date: toYMD(new Date()), label: "", payout: "", item_cost: "", shipping: "" });
+
+  // ── load saved connection ──
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get(CONN_KEY);
+        if (r && r.value) setConn(JSON.parse(r.value));
+      } catch {}
+      setBooted(true);
+    })();
+  }, []);
+
+  // ── supabase REST helper ──
+  const sb = useCallback(async (path, opts = {}) => {
+    const res = await fetch(`${conn.url.replace(/\/+$/, "")}/rest/v1/${path}`, {
+      ...opts,
+      headers: { apikey: conn.key, Authorization: `Bearer ${conn.key}`, "Content-Type": "application/json", ...(opts.headers || {}) },
+    });
+    if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).slice(0, 160)}`);
+    const t = await res.text();
+    return t ? JSON.parse(t) : null;
+  }, [conn]);
+
+  const loadAll = useCallback(async () => {
+    if (!conn) return;
+    setErr("");
+    try {
+      const [wm, ws, sl] = await Promise.all([
+        sb("watch_models?select=model,created_at&order=created_at.desc"),
+        sb("watch_status?select=model,status,qty,name,checked_at"),
+        sb("sales?select=*&order=date.desc,id.desc"),
+      ]);
+      setWatch(wm || []);
+      const map = {};
+      (ws || []).forEach((r) => (map[norm(r.model)] = r));
+      setStatus(map);
+      setSales(sl || []);
+      // recent arrivals — fetched separately so a missing read-policy can't break the rest
+      try {
+        const ar = await sb("new_arrivals?select=model,name,brand,qty,price,first_seen&order=first_seen.desc&limit=60");
+        setArrivals(ar || []); setArrErr(false);
+      } catch { setArrErr(true); }
+    } catch (e) {
+      setErr("Couldn't reach your database. Double-check the URL and publishable key, and that you ran the one-time setup SQL. (" + e.message + ")");
+    }
+  }, [conn, sb]);
+
+  useEffect(() => { if (conn) loadAll(); }, [conn, loadAll]);
+
+  // ── connect ──
+  async function connect() {
+    const url = connForm.url.trim().replace(/\/+$/, "");
+    const key = connForm.key.trim();
+    if (!url || !key) return;
+    setErr("");
+    try {
+      const res = await fetch(`${url}/rest/v1/watch_models?select=model&limit=1`, {
+        headers: { apikey: key, Authorization: `Bearer ${key}` },
+      });
+      if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).slice(0, 160)}`);
+      const c = { url, key };
+      await window.storage.set(CONN_KEY, JSON.stringify(c));
+      setConn(c);
+    } catch (e) {
+      setErr("Connection test failed. Check the URL and publishable key, and that the setup SQL ran. (" + e.message + ")");
+    }
+  }
+  async function disconnect() {
+    try { await window.storage.delete(CONN_KEY); } catch {}
+    setConn(null); setWatch([]); setStatus({}); setSales([]);
+  }
+
+  // ── watchlist actions ──
+  async function addSku(modelArg) {
+    const fromArg = typeof modelArg === "string";
+    const model = norm(fromArg ? modelArg : newSku);
+    if (!model) return;
+    if (watch.some((w) => norm(w.model) === model)) { if (!fromArg) setNewSku(""); return; }
+    try {
+      await sb("watch_models", { method: "POST", headers: { Prefer: "return=minimal,resolution=ignore-duplicates" }, body: JSON.stringify([{ model }]) });
+      if (!fromArg) setNewSku("");
+      loadAll();
+    } catch (e) { setErr("Couldn't add that SKU: " + e.message); }
+  }
+  async function removeSku(model) {
+    try {
+      await sb(`watch_models?model=eq.${encodeURIComponent(model)}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
+      loadAll();
+    } catch (e) { setErr("Couldn't remove that SKU: " + e.message); }
+  }
+
+  // ── profit actions ──
+  function applyPaste(text) {
+    setPaste(text);
+    const p = parsePayout(text);
+    if (p !== null) setSale((s) => ({ ...s, payout: String(p) }));
+  }
+  async function addSale() {
+    if (sale.payout === "" && sale.item_cost === "" && sale.shipping === "") return;
+    try {
+      await sb("sales", {
+        method: "POST", headers: { Prefer: "return=minimal" },
+        body: JSON.stringify([{
+          date: sale.date || toYMD(new Date()), label: sale.label.trim(),
+          payout: Number(sale.payout) || 0, item_cost: Number(sale.item_cost) || 0, shipping: Number(sale.shipping) || 0,
+        }]),
+      });
+      setSale({ date: toYMD(new Date()), label: "", payout: "", item_cost: "", shipping: "" });
+      setPaste("");
+      loadAll();
+    } catch (e) { setErr("Couldn't save that sale: " + e.message); }
+  }
+  async function removeSale(id) {
+    try { await sb(`sales?id=eq.${id}`, { method: "DELETE", headers: { Prefer: "return=minimal" } }); loadAll(); }
+    catch (e) { setErr("Couldn't remove that sale: " + e.message); }
+  }
+
+  // ── derived ──
+  const skuRows = useMemo(() => watch.map((w) => {
+    const st = status[norm(w.model)];
+    return { model: w.model, status: st ? st.status : "pending", qty: st ? st.qty : null, name: st ? st.name : "" };
+  }).sort((a, b) => {
+    const rank = { gone: 0, out: 1, low: 2, pending: 3, ok: 4 };
+    return (rank[a.status] - rank[b.status]) || a.model.localeCompare(b.model);
+  }), [watch, status]);
+
+  const skuCounts = useMemo(() => {
+    const c = { gone: 0, out: 0, low: 0, ok: 0, pending: 0 };
+    skuRows.forEach((r) => c[r.status]++);
+    return c;
+  }, [skuRows]);
+
+  const watchedSet = useMemo(() => new Set(watch.map((w) => norm(w.model))), [watch]);
+
+  const bounds = useMemo(() => {
+    const now = new Date(); const sow = new Date(now); sow.setDate(now.getDate() - now.getDay());
+    return { today: toYMD(now), week: toYMD(sow), month: toYMD(new Date(now.getFullYear(), now.getMonth(), 1)) };
+  }, []);
+  const profitOf = (t) => (Number(t.payout) || 0) - (Number(t.item_cost) || 0) - (Number(t.shipping) || 0);
+  const salesInPeriod = useMemo(() => sales.filter((t) => {
+    if (period === "all") return true;
+    if (period === "today") return t.date === bounds.today;
+    return t.date >= bounds[period];
+  }), [sales, period, bounds]);
+  const totals = useMemo(() => {
+    let payout = 0, profit = 0;
+    salesInPeriod.forEach((t) => { payout += Number(t.payout) || 0; profit += profitOf(t); });
+    return { orders: salesInPeriod.length, payout, profit, margin: payout > 0 ? (profit / payout) * 100 : null };
+  }, [salesInPeriod]);
+
+  // ── render ──
+  if (!booted) return <div style={S.wrap}><style>{CSS}</style><div style={S.empty}>Loading…</div></div>;
+
+  if (!conn) {
+    return (
+      <div style={S.wrap}><style>{CSS}</style>
+        <header style={S.header}>
+          <div style={S.brandRow}><span style={S.mono}>R</span>
+            <div><h1 style={S.title}>Command Page</h1><p style={S.sub}>Bubba's Collective</p></div></div>
+        </header>
+        <div style={S.panel}>
+          <div style={S.panelTitle}>Connect your database (one time)</div>
+          <p style={S.hint}>From your <b>Zager Monitor</b> Supabase project. The publishable key is the browser-safe one
+            (<code style={S.code}>sb_publishable_…</code>), not the secret. Saved on this device only.</p>
+          <label style={S.fieldWrap}><span style={S.fieldLabel}>Project URL</span>
+            <input style={S.field} placeholder="https://yourref.supabase.co" value={connForm.url}
+              onChange={(e) => setConnForm({ ...connForm, url: e.target.value })} /></label>
+          <label style={S.fieldWrap}><span style={S.fieldLabel}>Publishable key</span>
+            <input style={S.field} type="password" placeholder="sb_publishable_…" value={connForm.key}
+              onChange={(e) => setConnForm({ ...connForm, key: e.target.value })} /></label>
+          {err && <div style={S.errBox}>{err}</div>}
+          <button style={S.btnPrimary} onClick={connect}>Connect</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={S.wrap}><style>{CSS}</style>
+      <header style={S.header}>
+        <div style={S.brandRow}><span style={S.mono}>R</span>
+          <div><h1 style={S.title}>Command Page</h1><p style={S.sub}>Bubba's Collective · connected</p></div></div>
+        <button style={S.linkBtn} onClick={disconnect}>Disconnect</button>
+      </header>
+
+      {err && <div style={{ ...S.errBox, margin: "12px 22px 0" }}>{err}</div>}
+
+      {/* ───── STOCK WATCH ───── */}
+      <div style={S.sectionHead}>
+        <span style={S.sectionNum}>1</span><span style={S.sectionTitle}>Stock watch</span>
+        <div style={S.chips}>
+          {skuCounts.gone > 0 && <Chip c={PURPLE} n={skuCounts.gone} l="gone" />}
+          {skuCounts.out > 0 && <Chip c={RED} n={skuCounts.out} l="out" />}
+          {skuCounts.low > 0 && <Chip c={AMBER} n={skuCounts.low} l="low" />}
+          <Chip c={GREEN} n={skuCounts.ok} l="ok" />
+        </div>
+      </div>
+      <p style={S.sectionNote}>Add the model numbers you've listed. They save to your database and the hourly robot
+        emails you when one goes <b>OUT</b> or drops off the feed. New SKUs show <b>PENDING</b> until the next hourly check.</p>
+
+      <div style={S.addBar}>
+        <input style={{ ...S.field, flex: 1, minWidth: 150 }} placeholder="Enter a SKU / model # (e.g. 30458)"
+          value={newSku} onChange={(e) => setNewSku(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addSku()} />
+        <button style={S.btnPrimary} onClick={addSku}>+ Track SKU</button>
+      </div>
+
+      {skuRows.length === 0 ? (
+        <div style={S.empty}>No SKUs tracked yet. Type a model number above and hit Track SKU.</div>
+      ) : (
+        <div style={S.table}>
+          {skuRows.map((r) => {
+            const st = STATUS[r.status] || STATUS.pending;
+            return (
+              <div key={r.model} style={{ ...S.row, borderLeft: `4px solid ${st.c}` }}>
+                <span style={{ ...S.badge, background: st.c }}>{st.t}</span>
+                <span style={{ flex: 0, minWidth: 90, fontFamily: "'DM Mono', monospace", fontWeight: 600 }}>{r.model}</span>
+                <span style={{ flex: 1, color: "#3a4a5e", fontSize: 13.5 }}>{r.name || (r.status === "pending" ? "awaiting first check…" : "—")}</span>
+                <span style={{ width: 70, textAlign: "center", fontFamily: "'DM Mono', monospace",
+                  color: r.status === "out" || r.status === "gone" ? RED : r.status === "low" ? AMBER : NAVY }}>
+                  {r.qty ?? "—"}</span>
+                <button style={S.del} onClick={() => removeSku(r.model)} title="Stop tracking">×</button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ───── RECENT AT ZAGER ───── */}
+      <div style={{ ...S.sectionHead, marginTop: 22 }}>
+        <span style={S.sectionNum}>2</span><span style={S.sectionTitle}>Recent at Zager</span>
+        {!arrErr && arrivals.length > 0 && <span style={{ fontSize: 12, color: "#8194a8" }}>{arrivals.length} newest</span>}
+      </div>
+      <p style={S.sectionNote}>Brand-new items the robot has spotted in the feed since your monitor started — newest first.
+        Hit <b>+ Track</b> to start watching one.</p>
+
+      {arrErr ? (
+        <div style={S.empty}>This section needs one more read-permission. Run the one-line SQL from chat, then click Disconnect → reconnect to refresh.</div>
+      ) : arrivals.length === 0 ? (
+        <div style={S.empty}>Nothing new recorded yet. This fills in as Zager adds products after your baseline — check back as it builds up.</div>
+      ) : (
+        <div style={S.table}>
+          <div style={S.thead}>
+            <span style={{ width: 84 }}>Model</span><span style={{ flex: 1 }}>Name</span>
+            <span style={{ width: 50, textAlign: "center" }}>Qty</span><span style={{ width: 64, textAlign: "right" }}>Price</span>
+            <span style={{ width: 64, textAlign: "right" }}>Added</span><span style={{ width: 72 }} />
+          </div>
+          {arrivals.map((a) => {
+            const tracked = watchedSet.has(norm(a.model));
+            return (
+              <div key={a.model} style={{ ...S.row, borderLeft: `4px solid ${PRIMARY}` }}>
+                <span style={{ width: 84, fontFamily: "'DM Mono', monospace", fontWeight: 600 }}>{a.model}</span>
+                <span style={{ flex: 1, color: "#3a4a5e", fontSize: 13 }}>
+                  {a.name || "—"}{a.brand ? <span style={{ color: "#8194a8" }}> · {a.brand}</span> : null}
+                </span>
+                <span style={{ width: 50, textAlign: "center", fontFamily: "'DM Mono', monospace" }}>{a.qty ?? "—"}</span>
+                <span style={{ width: 64, textAlign: "right", fontFamily: "'DM Mono', monospace", fontSize: 13 }}>{a.price ? "$" + a.price : "—"}</span>
+                <span style={{ width: 64, textAlign: "right", fontSize: 11.5, color: "#8194a8" }}>{relTime(a.first_seen)}</span>
+                <span style={{ width: 72, textAlign: "right" }}>
+                  {tracked
+                    ? <span style={{ fontSize: 11.5, color: GREEN, fontWeight: 600 }}>✓ tracking</span>
+                    : <button style={S.btnMini} onClick={() => addSku(a.model)}>+ Track</button>}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ───── PROFIT ───── */}
+      <div style={{ ...S.sectionHead, marginTop: 22 }}>
+        <span style={S.sectionNum}>3</span><span style={S.sectionTitle}>Profit</span>
+        <div style={S.periodTabs}>
+          {PERIODS.map((p) => (
+            <button key={p.id} onClick={() => setPeriod(p.id)} style={{ ...S.tab, ...(period === p.id ? S.tabOn : {}) }}>{p.label}</button>
+          ))}
+        </div>
+      </div>
+
+      <div style={S.summary}>
+        <div style={S.bigProfit}>
+          <span style={S.bigLabel}>{PERIODS.find((p) => p.id === period).label} profit</span>
+          <span style={{ ...S.bigNum, color: totals.profit >= 0 ? GREEN : RED }}>{money(totals.profit)}</span>
+          <span style={S.bigSub}>{totals.orders} {totals.orders === 1 ? "sale" : "sales"}{totals.margin !== null && ` · ${totals.margin.toFixed(1)}% margin`}</span>
+        </div>
+        <div style={S.miniStat}><span style={S.statLabel}>Payout in</span><span style={S.statVal}>{money(totals.payout)}</span></div>
+        <div style={S.miniStat}><span style={S.statLabel}>Avg / sale</span><span style={S.statVal}>{money(totals.orders ? totals.profit / totals.orders : 0)}</span></div>
+      </div>
+
+      <div style={S.panel}>
+        <div style={S.panelTitle}>Add a sale</div>
+        <textarea style={S.textarea} rows={2} placeholder="Optional: paste the TikTok settlement and I'll grab the payout…"
+          value={paste} onChange={(e) => applyPaste(e.target.value)} />
+        <div style={S.formRow}>
+          <label style={S.fieldWrap}><span style={S.fieldLabel}>Date</span>
+            <input type="date" style={{ ...S.field, width: 150 }} value={sale.date} onChange={(e) => setSale({ ...sale, date: e.target.value })} /></label>
+          <label style={{ ...S.fieldWrap, flex: 1 }}><span style={S.fieldLabel}>Item (optional)</span>
+            <input style={S.field} list="skulist" placeholder="e.g. 30458" value={sale.label} onChange={(e) => setSale({ ...sale, label: e.target.value })} />
+            <datalist id="skulist">{watch.map((w) => <option key={w.model} value={w.model} />)}</datalist></label>
+        </div>
+        <div style={S.formRow}>
+          <label style={S.fieldWrap}><span style={S.fieldLabel}>Payout $</span>
+            <input type="number" step="0.01" style={{ ...S.field, width: 130 }} placeholder="114.45" value={sale.payout} onChange={(e) => setSale({ ...sale, payout: e.target.value })} /></label>
+          <label style={S.fieldWrap}><span style={S.fieldLabel}>Item cost $</span>
+            <input type="number" step="0.01" style={{ ...S.field, width: 130 }} placeholder="Zager cost" value={sale.item_cost} onChange={(e) => setSale({ ...sale, item_cost: e.target.value })} /></label>
+          <label style={S.fieldWrap}><span style={S.fieldLabel}>Shipping $</span>
+            <input type="number" step="0.01" style={{ ...S.field, width: 130 }} placeholder="label" value={sale.shipping} onChange={(e) => setSale({ ...sale, shipping: e.target.value })} /></label>
+        </div>
+        <div style={S.addBarBetween}>
+          <span style={S.preview}>Profit on this sale: <strong style={{ color: profitOf(sale) >= 0 ? GREEN : RED }}>{money(profitOf(sale))}</strong></span>
+          <button style={S.btnPrimary} onClick={addSale}>+ Add sale</button>
+        </div>
+      </div>
+
+      {salesInPeriod.length === 0 ? (
+        <div style={S.empty}>No sales in this period yet.</div>
+      ) : (
+        <div style={S.table}>
+          <div style={S.thead}>
+            <span style={{ width: 60 }}>Date</span><span style={{ flex: 1 }}>Item</span>
+            <span style={{ width: 80, textAlign: "right" }}>Payout</span><span style={{ width: 80, textAlign: "right" }}>Cost</span>
+            <span style={{ width: 84, textAlign: "right" }}>Profit</span><span style={{ width: 28 }} />
+          </div>
+          {salesInPeriod.map((t) => {
+            const p = profitOf(t);
+            return (
+              <div key={t.id} style={{ ...S.row, borderLeft: `4px solid ${p >= 0 ? GREEN : RED}` }}>
+                <span style={{ width: 60, fontFamily: "'DM Mono', monospace", fontSize: 13 }}>{String(t.date).slice(5)}</span>
+                <span style={{ flex: 1, color: "#3a4a5e" }}>{t.label || "—"}</span>
+                <span style={{ width: 80, textAlign: "right", fontFamily: "'DM Mono', monospace" }}>{money(t.payout)}</span>
+                <span style={{ width: 80, textAlign: "right", fontFamily: "'DM Mono', monospace", color: "#8194a8" }}>{money((Number(t.item_cost) || 0) + (Number(t.shipping) || 0))}</span>
+                <span style={{ width: 84, textAlign: "right", fontFamily: "'DM Mono', monospace", fontWeight: 600, color: p >= 0 ? GREEN : RED }}>{money(p)}</span>
+                <button style={S.del} onClick={() => removeSale(t.id)} title="Remove">×</button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <footer style={S.footer}>
+        SKUs and sales save to your Supabase. The hourly robot still sends the out-of-stock emails — this page just lets you
+        manage everything in one place. Profit = payout − item cost − shipping (TikTok fees/discount are already out of the payout).
+      </footer>
+    </div>
+  );
+}
+
+function Chip({ c, n, l }) {
+  return <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12, color: "#cfe0f5" }}>
+    <span style={{ width: 8, height: 8, borderRadius: "50%", background: c }} /><b style={{ color: "#fff" }}>{n}</b> {l}</span>;
+}
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@600;700&family=Manrope:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap');
+* { box-sizing: border-box; }
+input:focus, textarea:focus { outline: none; border-color: ${PRIMARY} !important; box-shadow: 0 0 0 3px rgba(55,138,221,0.15); }
+button { cursor: pointer; transition: filter .15s, opacity .15s; }
+button:hover:not(:disabled) { filter: brightness(1.08); }
+button:disabled { opacity: .4; cursor: not-allowed; }
+`;
+
+const S = {
+  wrap: { fontFamily: "'Manrope', sans-serif", maxWidth: 780, margin: "0 auto", color: NAVY, background: "#F4F7FB", borderRadius: 16, overflow: "hidden", border: "1px solid #dce6f2", paddingBottom: 8 },
+  header: { background: `linear-gradient(135deg, ${NAVY}, ${DARKBLUE})`, color: "#fff", padding: "18px 22px", display: "flex", justifyContent: "space-between", alignItems: "center" },
+  brandRow: { display: "flex", alignItems: "center", gap: 12 },
+  mono: { width: 34, height: 34, borderRadius: 8, background: PRIMARY, display: "grid", placeItems: "center", fontFamily: "'Sora', sans-serif", fontWeight: 700, fontSize: 20, color: "#fff" },
+  title: { fontFamily: "'Sora', sans-serif", fontSize: 21, margin: 0, letterSpacing: -0.5 },
+  sub: { margin: "2px 0 0", fontSize: 12.5, color: "#aecdf0" },
+  linkBtn: { background: "transparent", color: "#aecdf0", border: "1px solid rgba(255,255,255,0.25)", borderRadius: 8, padding: "6px 11px", fontSize: 12.5, fontFamily: "'Manrope', sans-serif" },
+
+  sectionHead: { display: "flex", alignItems: "center", gap: 10, padding: "16px 22px 4px", flexWrap: "wrap" },
+  sectionNum: { width: 22, height: 22, borderRadius: "50%", background: NAVY, color: "#fff", display: "grid", placeItems: "center", fontSize: 12, fontWeight: 700, fontFamily: "'Sora', sans-serif" },
+  sectionTitle: { fontFamily: "'Sora', sans-serif", fontSize: 17, fontWeight: 600, flex: 1 },
+  sectionNote: { margin: "2px 22px 10px", fontSize: 12.5, color: "#52677e", lineHeight: 1.5 },
+  chips: { display: "flex", gap: 12, background: NAVY, padding: "6px 12px", borderRadius: 9 },
+  periodTabs: { display: "flex", gap: 5 },
+  tab: { background: "#fff", color: "#52677e", border: "1px solid #cdd9e8", borderRadius: 8, padding: "6px 12px", fontSize: 12.5, fontWeight: 600, fontFamily: "'Manrope', sans-serif" },
+  tabOn: { background: NAVY, color: "#fff", borderColor: NAVY },
+
+  addBar: { display: "flex", gap: 10, padding: "0 22px 12px", flexWrap: "wrap", alignItems: "center" },
+  addBarBetween: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginTop: 2 },
+  table: { margin: "0 22px", background: "#fff", borderRadius: 12, overflow: "hidden", border: "1px solid #dce6f2" },
+  thead: { display: "flex", alignItems: "center", gap: 10, padding: "9px 14px", background: "#eef3f9", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.4, color: "#5b7088" },
+  row: { display: "flex", alignItems: "center", gap: 10, padding: "10px 14px 10px 10px", borderTop: "1px solid #eef2f7", fontSize: 14 },
+  badge: { color: "#fff", fontSize: 10, fontWeight: 700, padding: "3px 7px", borderRadius: 6, letterSpacing: 0.5, minWidth: 58, textAlign: "center" },
+  del: { width: 26, height: 26, borderRadius: 7, border: "none", background: "#f3f5f8", color: "#9aa7b8", fontSize: 18, lineHeight: 1, display: "grid", placeItems: "center" },
+
+  summary: { display: "flex", gap: 10, padding: "0 22px 12px", flexWrap: "wrap" },
+  bigProfit: { display: "flex", flexDirection: "column", justifyContent: "center", minWidth: 190, flex: 1, background: "#fff", border: "1px solid #dce6f2", borderRadius: 12, padding: "14px 18px" },
+  bigLabel: { fontSize: 11.5, textTransform: "uppercase", letterSpacing: 0.5, color: "#8194a8", fontWeight: 600 },
+  bigNum: { fontFamily: "'Sora', sans-serif", fontSize: 30, fontWeight: 700, lineHeight: 1.1, margin: "3px 0" },
+  bigSub: { fontSize: 12.5, color: "#52677e" },
+  miniStat: { background: "#fff", border: "1px solid #dce6f2", borderRadius: 12, padding: "12px 16px", display: "flex", flexDirection: "column", justifyContent: "center", minWidth: 110 },
+  statLabel: { fontSize: 11, textTransform: "uppercase", letterSpacing: 0.4, color: "#8194a8", fontWeight: 600 },
+  statVal: { fontFamily: "'DM Mono', monospace", fontSize: 18, fontWeight: 500, marginTop: 2 },
+
+  panel: { margin: "0 22px 12px", padding: 16, background: "#fff", borderRadius: 12, border: "1px solid #dce6f2" },
+  panelTitle: { fontFamily: "'Sora', sans-serif", fontSize: 14.5, fontWeight: 600, marginBottom: 10 },
+  hint: { margin: "0 0 12px", fontSize: 13, color: "#52677e", lineHeight: 1.5 },
+  code: { background: "#eef3f9", padding: "1px 6px", borderRadius: 5, fontFamily: "'DM Mono', monospace", fontSize: 12 },
+  textarea: { width: "100%", padding: "10px 12px", borderRadius: 9, border: "1px solid #cdd9e8", fontSize: 13.5, fontFamily: "'Manrope', sans-serif", resize: "vertical", marginBottom: 12, background: "#fbfdff" },
+  formRow: { display: "flex", gap: 10, marginBottom: 10, flexWrap: "wrap" },
+  fieldWrap: { display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 },
+  fieldLabel: { fontSize: 11.5, color: "#52677e", fontWeight: 600 },
+  field: { padding: "9px 11px", borderRadius: 8, border: "1px solid #cdd9e8", fontSize: 14, fontFamily: "'Manrope', sans-serif", width: "100%" },
+  preview: { fontSize: 14, color: "#52677e" },
+  btnPrimary: { background: PRIMARY, color: "#fff", border: "none", borderRadius: 9, padding: "10px 16px", fontSize: 13.5, fontWeight: 600, fontFamily: "'Manrope', sans-serif", whiteSpace: "nowrap" },
+  btnMini: { background: "#eef3f9", color: DARKBLUE, border: `1px solid ${BORDER}`, borderRadius: 7, padding: "5px 9px", fontSize: 11.5, fontWeight: 600, fontFamily: "'Manrope', sans-serif", whiteSpace: "nowrap" },
+
+  empty: { margin: "0 22px 14px", padding: "30px 22px", textAlign: "center", color: "#5b7088", fontSize: 14, lineHeight: 1.6, background: "#fff", borderRadius: 12, border: "1px dashed #c6d4e4" },
+  errBox: { background: "#fdeaea", color: "#9b2226", border: "1px solid #f3c6c6", borderRadius: 9, padding: "10px 13px", fontSize: 13, lineHeight: 1.45, marginBottom: 12 },
+  footer: { padding: "12px 24px 18px", fontSize: 11.5, color: "#8194a8", lineHeight: 1.5 },
+};
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<CommandPage />);
+</script>
+</body>
+</html>
